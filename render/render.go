@@ -12,10 +12,23 @@ import (
 	jinja2 "github.com/kluctl/go-jinja2"
 )
 
+// multiStringFlag 用于支持多个-d参数
+type multiStringFlag []string
+
+func (m *multiStringFlag) String() string {
+	return fmt.Sprintf("%v", *m)
+}
+
+func (m *multiStringFlag) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
 // Execute 解析命令行参数，读取模板和渲染参数，执行Jinja2渲染并输出结果。
 func Execute() {
 	templatePath := flag.String("t", "", "模板文件路径，未指定则使用标准输入")
-	flag.String("d", "", "参数文件路径（JSON），未指定则用环境变量")
+	var dataFiles multiStringFlag
+	flag.Var(&dataFiles, "d", "参数文件路径（JSON），可指定多次，未指定则用环境变量")
 	flag.String("o", "", "输出文件路径，未指定则输出到标准输出")
 	flag.Parse()
 
@@ -37,46 +50,51 @@ func Execute() {
 		tpl = string(tplBytes)
 	}
 
-	// 参数处理（支持-d参数、JINJA2_VARS、RENDER_前缀环境变量）
-	var data map[string]interface{}
-	dFlag := flag.Lookup("d")
-	dataPath := ""
-	if dFlag != nil {
-		dataPath = dFlag.Value.String()
-	}
-	if dataPath != "" {
-		dataBytes, err := os.ReadFile(dataPath)
+	// 参数合并处理：多个-d、JINJA2_VARS、RENDER_，后者覆盖前者
+	data := make(map[string]interface{})
+	// 1. 合并所有-d指定的文件
+	for _, file := range dataFiles {
+		dataBytes, err := os.ReadFile(file)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "读取参数文件失败: %v\n", err)
 			os.Exit(1)
 		}
-		if err := json.Unmarshal(dataBytes, &data); err != nil {
+		var m map[string]interface{}
+		if err := json.Unmarshal(dataBytes, &m); err != nil {
 			fmt.Fprintf(os.Stderr, "解析参数文件失败: %v\n", err)
 			os.Exit(1)
 		}
-	} else if env := os.Getenv("JINJA2_VARS"); env != "" {
-		if err := json.Unmarshal([]byte(env), &data); err != nil {
+		for k, v := range m {
+			data[k] = v
+		}
+	}
+	// 2. 合并JINJA2_VARS
+	if env := os.Getenv("JINJA2_VARS"); env != "" {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(env), &m); err != nil {
 			fmt.Fprintf(os.Stderr, "解析JINJA2_VARS失败: %v\n", err)
 			os.Exit(1)
 		}
-	} else {
-		data = make(map[string]interface{})
-		for _, env := range os.Environ() {
-			if !strings.HasPrefix(env, "RENDER_") {
-				continue
-			}
-			parts := strings.SplitN(env, "=", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			key := parts[0][7:]
-			val := parts[1]
-			var v interface{}
-			if err := json.Unmarshal([]byte(val), &v); err == nil {
-				data[key] = v
-			} else {
-				data[key] = val
-			}
+		for k, v := range m {
+			data[k] = v
+		}
+	}
+	// 3. 合并RENDER_环境变量
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, "RENDER_") {
+			continue
+		}
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := parts[0][7:]
+		val := parts[1]
+		var v interface{}
+		if err := json.Unmarshal([]byte(val), &v); err == nil {
+			data[key] = v
+		} else {
+			data[key] = val
 		}
 	}
 
