@@ -32,14 +32,14 @@ else
 fi
 
 echo "== 测试RENDER_环境变量渲染 =="
-export RENDER_var1=foo RENDER_var2=3 RENDER_var3=6,7 RENDER_var4='{"subvar1":"bar"}'
+export RENDER_var1=foo RENDER_var2=3 RENDER_var3='[6,7]' RENDER_var4='{"subvar1":"bar"}'
 output=$(go run ../main.go -t test.tpl)
 unset RENDER_var1 RENDER_var2 RENDER_var3 RENDER_var4
 # 由于RENDER_变量全部为字符串，var3和var4.subvar1的渲染会有差异
 expected="hello, foo!
 var2: 3
 var3: 6,7
-var4.subvar1: {\"subvar1\":\"bar\"}"
+var4.subvar1: bar"
 if [ "$output" = "$expected" ]; then
   echo "RENDER_环境变量渲染通过"
 else

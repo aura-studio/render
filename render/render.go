@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	jinja2 "github.com/kluctl/go-jinja2"
 )
@@ -58,31 +59,26 @@ func Execute() {
 			fmt.Fprintf(os.Stderr, "解析JINJA2_VARS失败: %v\n", err)
 			os.Exit(1)
 		}
-       } else {
-	       data = make(map[string]interface{})
-	       for _, e := range os.Environ() {
-		       if len(e) > 7 && e[:7] == "RENDER_" {
-			       eq := -1
-			       for i := 7; i < len(e); i++ {
-				       if e[i] == '=' {
-					       eq = i
-					       break
-				       }
-			       }
-			       if eq > 7 {
-				       key := e[7:eq]
-				       val := e[eq+1:]
-				       // 尝试将val解析为JSON对象/数组，否则保留为字符串
-				       var v interface{}
-				       if err := json.Unmarshal([]byte(val), &v); err == nil {
-					       data[key] = v
-				       } else {
-					       data[key] = val
-				       }
-			       }
-		       }
-	       }
-       }
+	} else {
+		data = make(map[string]interface{})
+		for _, env := range os.Environ() {
+			if !strings.HasPrefix(env, "RENDER_") {
+				continue
+			}
+			parts := strings.SplitN(env, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := parts[0][7:]
+			val := parts[1]
+			var v interface{}
+			if err := json.Unmarshal([]byte(val), &v); err == nil {
+				data[key] = v
+			} else {
+				data[key] = val
+			}
+		}
+	}
 
 	// 渲染（构造WithGlobal参数并调用go-jinja2）
 	var opts []jinja2.Jinja2Opt
