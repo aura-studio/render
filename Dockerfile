@@ -1,4 +1,3 @@
-# 基于官方golang镜像进行构建和运行
 FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY . .
