@@ -4,7 +4,8 @@ COPY . .
 RUN go mod download && \
     CGO_ENABLED=0 go build -o render main.go
 
-FROM alpine:3.18 AS runtime
-WORKDIR /app
-COPY --from=builder /app/render /usr/local/bin/render
-ENTRYPOINT ["/usr/local/bin/render"]
+# FROM alpine:3.18 AS runtime
+# WORKDIR /app
+# COPY --from=builder /app/render /usr/local/bin/render
+# RUN chmod +x /usr/local/bin/render
+# ENTRYPOINT ["/usr/local/bin/render"]
