@@ -1,191 +1,114 @@
+// Package render 提供命令行渲染工具，支持Jinja2模板渲染，参数可来自文件、环境变量。
 package render
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"runtime"
-	"sort"
-	"strings"
 
-	pongo2 "github.com/flosch/pongo2/v6"
+	jinja2 "github.com/kluctl/go-jinja2"
 )
 
-// Execute 作为程序唯一入口，处理参数和退出码
+// Execute 解析命令行参数，读取模板和渲染参数，执行Jinja2渲染并输出结果。
 func Execute() {
-	tplFile := flag.String("f", "", "template file (.tmpl/.template)")
-	outFile := flag.String("o", "", "output file (optional)")
-	checkOnly := flag.Bool("check-only", false, "only validate required variables; no render")
-	emitDefaults := flag.Bool("emit-defaults", false, "print shell exports for defaults and exit")
+	templatePath := flag.String("t", "", "模板文件路径，未指定则使用标准输入")
+	flag.String("d", "", "参数文件路径（JSON），未指定则用环境变量")
+	flag.String("o", "", "输出文件路径，未指定则输出到标准输出")
 	flag.Parse()
 
-	if err := runAll(*tplFile, *outFile, *checkOnly, *emitDefaults); err != nil {
-		log.Fatal(err)
+	// 读取模板内容（支持-t参数或标准输入）
+	var tpl string
+	if *templatePath == "" {
+		tplBytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "从标准输入读取模板失败: %v\n", err)
+			os.Exit(1)
+		}
+		tpl = string(tplBytes)
+	} else {
+		tplBytes, err := os.ReadFile(*templatePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取模板文件失败: %v\n", err)
+			os.Exit(1)
+		}
+		tpl = string(tplBytes)
+	}
+
+	// 参数处理（支持-d参数、JINJA2_VARS、RENDER_前缀环境变量）
+	var data map[string]interface{}
+	dFlag := flag.Lookup("d")
+	dataPath := ""
+	if dFlag != nil {
+		dataPath = dFlag.Value.String()
+	}
+	if dataPath != "" {
+		dataBytes, err := os.ReadFile(dataPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取参数文件失败: %v\n", err)
+			os.Exit(1)
+		}
+		if err := json.Unmarshal(dataBytes, &data); err != nil {
+			fmt.Fprintf(os.Stderr, "解析参数文件失败: %v\n", err)
+			os.Exit(1)
+		}
+	} else if env := os.Getenv("JINJA2_VARS"); env != "" {
+		if err := json.Unmarshal([]byte(env), &data); err != nil {
+			fmt.Fprintf(os.Stderr, "解析JINJA2_VARS失败: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		data = make(map[string]interface{})
+		for _, e := range os.Environ() {
+			if len(e) > 7 && e[:7] == "RENDER_" {
+				eq := -1
+				for i := 7; i < len(e); i++ {
+					if e[i] == '=' {
+						eq = i
+						break
+					}
+				}
+				if eq > 7 {
+					key := e[7:eq]
+					val := e[eq+1:]
+					data[key] = val
+				}
+			}
+		}
+	}
+
+	// 渲染（构造WithGlobal参数并调用go-jinja2）
+	var opts []jinja2.Jinja2Opt
+	for k, v := range data {
+		opts = append(opts, jinja2.WithGlobal(k, v))
+	}
+
+	j2, err := jinja2.NewJinja2("render", 1, opts...)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初始化Jinja2失败: %v\n", err)
 		os.Exit(1)
 	}
-}
+	defer j2.Close()
 
-func runAll(tplFile, outFile string, checkOnly, emitDefaults bool) error {
-	if tplFile == "" {
-		return fmt.Errorf("-f required")
-	}
-	if ext := filepath.Ext(tplFile); ext != ".tmpl" && ext != ".template" {
-		return fmt.Errorf("unsupported suffix: %s", ext)
-	}
-	if st, err := os.Stat(tplFile); err != nil {
-		return err
-	} else if st.IsDir() {
-		return fmt.Errorf("template is directory")
-	}
-
-	b, err := os.ReadFile(tplFile)
+	result, err := j2.RenderString(tpl)
 	if err != nil {
-		return err
-	}
-	cleaned, required, defaults, err := parseDirectives(string(b))
-	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "渲染模板失败: %v\n", err)
+		os.Exit(1)
 	}
 
-	if emitDefaults {
-		keys := make([]string, 0, len(defaults))
-		for k := range defaults {
-			keys = append(keys, k)
+	// 输出（支持-o参数或标准输出）
+	oFlag := flag.Lookup("o")
+	outputPath := ""
+	if oFlag != nil {
+		outputPath = oFlag.Value.String()
+	}
+	if outputPath != "" {
+		if err := os.WriteFile(outputPath, []byte(result), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "写入输出文件失败: %v\n", err)
+			os.Exit(1)
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Printf("export %s=%q\n", k, defaults[k])
-		}
-		return nil
+	} else {
+		fmt.Print(result)
 	}
-
-	ctx := envContext()
-	for k, v := range defaults {
-		if cur, ok := ctx[k]; !ok || cur == "" {
-			ctx[k] = v
-		}
-	}
-
-	if len(required) > 0 {
-		missing := []string{}
-		for _, rv := range required {
-			if val, ok := ctx[rv]; !ok || strings.TrimSpace(fmt.Sprint(val)) == "" {
-				missing = append(missing, rv)
-			}
-		}
-		if len(missing) > 0 {
-			return fmt.Errorf("missing required variables: %s", strings.Join(missing, ", "))
-		}
-	}
-
-	if checkOnly {
-		return nil
-	}
-
-	tpl, err := pongo2.FromString(cleaned)
-	if err != nil {
-		return fmt.Errorf("parse: %w", err)
-	}
-
-	out, err := tpl.Execute(ctx)
-	if err != nil {
-		return fmt.Errorf("execute: %w", err)
-	}
-
-	target := outFile
-	if target == "" {
-		target = strings.TrimSuffix(tplFile, filepath.Ext(tplFile))
-	}
-	if err = os.WriteFile(target, []byte(out), 0644); err != nil {
-		return err
-	}
-	log.Printf("rendered %s => %s", tplFile, target)
-	return nil
-}
-
-// parseDirectives extracts custom directives and returns cleaned template string.
-// Directives:
-//
-//	{% required VAR1 VAR2 %}
-//	{% default VAR=value %}
-//
-// Variables with defaults are not treated as required even if also listed.
-func parseDirectives(s string) (clean string, required []string, defaults map[string]string, err error) {
-	reReq := regexp.MustCompile(`(?m)\{\%\s*required\s+([A-Za-z0-9_\s]+?)\s*\%\}`)
-	reDef := regexp.MustCompile(`(?m)\{\%\s*default\s+([A-Za-z0-9_]+)\s*=\s*(.*?)\s*\%\}`)
-	reqSet := map[string]struct{}{}
-	defaults = map[string]string{}
-
-	s = reReq.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reReq.FindStringSubmatch(m)
-		if len(sub) == 2 {
-			for _, f := range strings.Fields(sub[1]) {
-				if f != "" {
-					reqSet[f] = struct{}{}
-				}
-			}
-		}
-		return ""
-	})
-	s = reDef.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reDef.FindStringSubmatch(m)
-		if len(sub) == 3 {
-			key := sub[1]
-			raw := strings.TrimSpace(sub[2])
-			val := strings.Trim(raw, " \"'")
-			if strings.HasPrefix(raw, "`") && strings.HasSuffix(raw, "`") && len(raw) >= 2 {
-				cmdStr := strings.Trim(raw, "`")
-				if out, e := runShell(cmdStr); e == nil {
-					val = out
-				} else {
-					err = fmt.Errorf("default command failed for %s: %w", key, e)
-				}
-			}
-			defaults[key] = val
-		}
-		return ""
-	})
-	for k := range reqSet {
-		if _, has := defaults[k]; !has {
-			required = append(required, k)
-		}
-	}
-	sort.Strings(required)
-	clean = s
-	return
-}
-
-func envContext() pongo2.Context {
-	ctx := pongo2.Context{}
-	for _, e := range os.Environ() {
-		if i := strings.IndexByte(e, '='); i > 0 {
-			ctx[e[:i]] = e[i+1:]
-		}
-	}
-	return ctx
-}
-
-// runShell executes command via sh/bash/cmd depending on platform.
-func runShell(cmdStr string) (string, error) {
-	shell := "sh"
-	args := []string{"-c", cmdStr}
-	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("bash"); err == nil {
-			shell = "bash"
-			args = []string{"-c", cmdStr}
-		} else {
-			shell = "cmd"
-			args = []string{"/C", cmdStr}
-		}
-	}
-	c := exec.Command(shell, args...)
-	out, err := c.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
 }
