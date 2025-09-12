@@ -7,5 +7,5 @@ RUN go mod download && \
 
 FROM alpine:3.18 AS runtime
 WORKDIR /app
-COPY --from=build /app/render /usr/local/bin/render
+COPY --from=builder /app/render /usr/local/bin/render
 ENTRYPOINT ["/usr/local/bin/render"]
